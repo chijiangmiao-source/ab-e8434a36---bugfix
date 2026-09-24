@@ -266,24 +266,68 @@ input.cell-err {
   color: #475569;
 }
 
-.ties {
+.tie-browser {
   margin-top: 14px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
   font-size: 13px;
   color: var(--muted);
 }
-button.tie {
-  padding: 4px 10px;
+.tie-pager > span:first-child {
+  display: block;
+  margin-bottom: 8px;
+}
+.tie-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.tie-page-nums {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.tie-caption {
+  margin: 8px 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+.tie-loading {
+  margin: 10px 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+.tie-jump input {
+  width: 48px;
+  padding: 3px 6px;
+  margin: 0 4px;
+  text-align: center;
+}
+.tie-status {
+  color: var(--muted);
+}
+.tie-error {
+  display: block;
+  margin-top: 6px;
+  color: #b91c1c;
+}
+button.tie-num {
+  min-width: 34px;
+  padding: 4px 8px;
   font-size: 12px;
   font-family: ui-monospace, monospace;
 }
-button.tie.active {
+button.tie-num.active {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+button.tie-step {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+button.tie-step:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .infeasible {

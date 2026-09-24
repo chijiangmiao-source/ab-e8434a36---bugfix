@@ -28,9 +28,19 @@ export interface FieldError {
 export interface AuditResponse {
   feasible: boolean;
   solution: SolutionOut | null;
+  // Only the first page of tied solutions; tie_count is the exact total.
   tied: SolutionOut[];
   tie_count: number;
+  tie_offset: number;
+  tie_page_size: number;
   classification: Record<string, "always" | "partial" | "never">;
+  errors: FieldError[];
+}
+
+export interface TiePageOut {
+  offset: number;
+  tie_count: number;
+  solutions: SolutionOut[];
   errors: FieldError[];
 }
 

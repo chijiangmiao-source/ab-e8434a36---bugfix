@@ -12,6 +12,9 @@ from fastapi.responses import JSONResponse
 from .models import (
     AuditRequest,
     AuditResponse,
+    TIE_PAGE_SIZE,
+    TiePageRequest,
+    TiePageOut,
     SolutionOut,
     WeightOut,
 )
@@ -79,12 +82,25 @@ def _solution_out(sol: Solution) -> SolutionOut:
     )
 
 
+def _run(req_endmembers, req_target) -> tuple[AuditResult | None, list]:
+    """Validate and solve; returns (result, errors)."""
+    endmembers, target, errors = validate_request(req_endmembers, list(req_target))
+    if errors:
+        return None, errors
+    return audit(endmembers, target), []
+
+
 def _serialize(result: AuditResult) -> AuditResponse:
+    # Only the first page of tied solutions is inlined; the complete tie set
+    # stays available through POST /api/audit/ties.
+    page = result.tied[:TIE_PAGE_SIZE]
     return AuditResponse(
         feasible=result.feasible,
         solution=_solution_out(result.solution) if result.solution else None,
-        tied=[_solution_out(s) for s in result.tied],
+        tied=[_solution_out(s) for s in page],
         tie_count=len(result.tied),
+        tie_offset=0,
+        tie_page_size=TIE_PAGE_SIZE,
         classification=result.classification,
         errors=[],
     )
@@ -92,7 +108,31 @@ def _serialize(result: AuditResult) -> AuditResponse:
 
 @app.post("/api/audit", response_model=AuditResponse)
 def run_audit(req: AuditRequest) -> AuditResponse:
-    endmembers, target, errors = validate_request(req.endmembers, list(req.target))
+    result, errors = _run(req.endmembers, req.target)
     if errors:
         return AuditResponse(feasible=False, errors=errors)
-    return _serialize(audit(endmembers, target))
+    return _serialize(result)
+
+
+@app.post("/api/audit/ties", response_model=TiePageOut)
+def run_audit_ties(req: TiePageRequest) -> TiePageOut:
+    """Return one canonical-order page of the first-two-level tied solutions.
+
+    Stateless: the client resends the audit input, so no result set is held
+    on the server.  Paging never affects tie_count or classification, both of
+    which the first /api/audit response already reports from the full
+    enumeration.
+    """
+    result, errors = _run(req.endmembers, req.target)
+    if errors:
+        return TiePageOut(offset=0, tie_count=0, solutions=[], errors=errors)
+    assert result is not None
+    total = len(result.tied)
+    offset = min(req.offset, total)
+    page = result.tied[offset:offset + req.limit]
+    return TiePageOut(
+        offset=offset,
+        tie_count=total,
+        solutions=[_solution_out(s) for s in page],
+        errors=[],
+    )

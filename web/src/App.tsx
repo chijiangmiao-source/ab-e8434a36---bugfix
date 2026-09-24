@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor } from "./components/Editor";
 import { Projection, type PlotPoint } from "./components/Projection";
 import { ResultsPanel } from "./components/ResultsPanel";
-import { fetchHealth, runAudit } from "./api";
+import { fetchHealth, fetchTies, runAudit } from "./api";
 import { DEFAULT_ENDMEMBERS, DEFAULT_TARGET } from "./defaults";
-import type { AuditResponse, EndmemberRow } from "./types";
+import type { AuditRequest, AuditResponse, EndmemberRow, SolutionOut } from "./types";
 import "./styles.css";
 
 export default function App() {
@@ -16,6 +16,18 @@ export default function App() {
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [health, setHealth] = useState<boolean | null>(null);
   const [networkError, setNetworkError] = useState<string | null>(null);
+
+  // Paged tie browser: only one page (at most tie_page_size solutions) is
+  // held per offset, and pages are fetched lazily.  The full tie set is
+  // never materialised in the browser.
+  const [tiePages, setTiePages] = useState<Map<number, SolutionOut[]>>(new Map());
+  const [pageStart, setPageStart] = useState(0);
+  const [pageLoading, setPageLoading] = useState(false);
+  const [pageError, setPageError] = useState<string | null>(null);
+  // The exact request that produced `result`; tie pages must be paged over
+  // the same input even if the editor changed afterwards.
+  const resultRequest = useRef<AuditRequest | null>(null);
+  const requestSeq = useRef(0);
 
   useEffect(() => {
     let alive = true;
@@ -46,16 +58,72 @@ export default function App() {
   const audit = useCallback(async () => {
     setLoading(true);
     setNetworkError(null);
+    const req: AuditRequest = { endmembers, target };
+    const seq = ++requestSeq.current;
     try {
-      const res = await runAudit({ endmembers, target });
+      const res = await runAudit(req);
+      if (seq !== requestSeq.current) return;
+      resultRequest.current = req;
       setResult(res);
       setSelectedTie(0);
+      // The first audit response inlines exactly the first tie page; seed
+      // the cache with it instead of re-requesting, and never with more.
+      setTiePages(res.tied.length ? new Map([[0, res.tied]]) : new Map());
+      setPageStart(0);
+      setPageError(null);
+      setPageLoading(false);
     } catch (err) {
+      if (seq !== requestSeq.current) return;
       setNetworkError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
   }, [endmembers, target]);
+
+  // Lazily fetch one page of tied solutions; first page comes from the
+  // initial audit response and is never fetched twice.
+  const loadPage = useCallback(async (offset: number) => {
+    const req = resultRequest.current;
+    if (!result || !req) return;
+    if (offset === 0 && tiePages.has(0)) {
+      setPageStart(0);
+      return;
+    }
+    if (tiePages.has(offset)) {
+      setPageStart(offset);
+      return;
+    }
+    const seq = ++requestSeq.current;
+    setPageLoading(true);
+    setPageError(null);
+    try {
+      const page = await fetchTies(req, offset, result.tie_page_size);
+      if (seq !== requestSeq.current) return;
+      if (page.errors.length) {
+        setPageError(page.errors.map((e) => e.message).join("；"));
+        return;
+      }
+      setTiePages((prev) => {
+        const next = new Map(prev);
+        next.set(offset, page.solutions);
+        return next;
+      });
+      setPageStart(offset);
+    } catch (err) {
+      if (seq !== requestSeq.current) return;
+      setPageError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (seq === requestSeq.current) setPageLoading(false);
+    }
+  }, [result, tiePages]);
+
+  // Pager navigation moves the selection to the first solution of the page;
+  // plain selection (numbered buttons) keeps its index and lazy-loads its
+  // page when necessary.
+  const gotoPage = useCallback((offset: number) => {
+    setSelectedTie(offset);
+    void loadPage(offset);
+  }, [loadPage]);
 
   const addRow = () => {
     if (endmembers.length >= 30) return;
@@ -72,9 +140,16 @@ export default function App() {
   };
 
   // ---- projection geometry -------------------------------------------------
-  const activeSolution = result?.feasible
-    ? result.tied[selectedTie] ?? result.solution
-    : null;
+  // The selected tie lives on a lazily-fetched page; null while loading.
+  const selectedSolution: SolutionOut | null = useMemo(() => {
+    if (!result?.feasible) return null;
+    const pageSize = result.tie_page_size;
+    const offset = Math.floor(selectedTie / pageSize) * pageSize;
+    const page = tiePages.get(offset);
+    return page ? page[selectedTie - offset] ?? null : null;
+  }, [result, selectedTie, tiePages]);
+
+  const activeSolution = selectedSolution;
 
   const weightById = useMemo(() => {
     const m = new Map<string, number>();
@@ -149,7 +224,19 @@ export default function App() {
         batchError={batchError}
       />
 
-      {result && <ResultsPanel result={result} selectedTie={selectedTie} onSelectTie={setSelectedTie} />}
+      {result && (
+        <ResultsPanel
+          result={result}
+          selectedTie={selectedTie}
+          onSelectTie={setSelectedTie}
+          pageStart={pageStart}
+          pageSolutions={tiePages.get(pageStart)}
+          pageLoading={pageLoading}
+          pageError={pageError}
+          onGotoPage={gotoPage}
+          selectedSolution={selectedSolution}
+        />
+      )}
 
       <section className="projections">
         <h2>③ 联动投影（悬停任意图中的端元可同步高亮）</h2>

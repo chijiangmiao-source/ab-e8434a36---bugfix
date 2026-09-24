@@ -16,6 +16,7 @@ Usage:  verify.py [api_base] [web_base]
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -49,6 +50,17 @@ def post(url: str, payload: dict, timeout: float = 5.0):
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, json.loads(r.read().decode())
+
+
+def post_raw(url: str, payload: dict, timeout: float = 30.0):
+    """POST returning the unparsed body so its exact size can be checked."""
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    return r.status, raw, len(data)
 
 
 def wait_for(url: str, label: str, attempts: int = 30) -> bool:
@@ -214,6 +226,162 @@ def check_smoke() -> None:
     check("API smoke: POST /api/audit through web proxy", roundtrip)
 
 
+# -------------------------------- 7. large tie set with long identifiers
+def _long_id_payload():
+    """30 endmembers (~1000-char unique ASCII ids) in four tetrahedron
+    groups of 7/7/8/8; target (1,1,1) forces one endmember from each group,
+    so the first-two-level tie set is exactly 7*7*8*8 = 3136."""
+    origins = [(0, 0, 0), (4, 0, 0), (0, 4, 0), (0, 0, 4)]
+    counts = (7, 7, 8, 8)
+    ems = []
+    for g, (origin, n) in enumerate(zip(origins, counts)):
+        for k in range(n):
+            stem = f"G{g}E{k:02d}-"
+            ems.append({
+                "id": stem + "x" * (1000 - len(stem)),
+                "t0": str(origin[0]), "t1": str(origin[1]),
+                "t2": str(origin[2]), "cost": "1",
+            })
+    return {"endmembers": ems, "target": ["1", "1", "1"]}
+
+
+def check_large_tie_paging() -> None:
+    payload = _long_id_payload()
+
+    # Submitted over the Compose network through the web proxy, exactly like
+    # the reported failure; the complete response is read and measured.
+    try:
+        status, raw, req_size = post_raw(f"{WEB}/api/audit", payload)
+        body = json.loads(raw.decode())
+    except Exception as exc:  # noqa: BLE001
+        check("3136 long-id ties: first audit response", False, str(exc))
+        return
+
+    page_size = body.get("tie_page_size")
+    ok = (
+        status == 200
+        and body.get("feasible") is True
+        and body.get("tie_count") == 3136
+        and page_size == 20
+        and len(body.get("tied", [])) == 20
+        and body.get("tie_offset") == 0
+    )
+    check(
+        "3136 long-id ties: tie_count exact, only one page inlined",
+        ok,
+        json.dumps({k: body.get(k) for k in
+                    ("feasible", "tie_count", "tie_offset", "tie_page_size")})
+        + f" inlined={len(body.get('tied', []))}",
+    )
+
+    # Response/request size ratio used to be ~831x (26.2 MB vs 33 KB); with
+    # one page inlined it must stay a small single-digit-ish multiple and in
+    # any case far below the megabytes a full expansion needs.
+    ratio = len(raw) / req_size
+    size_ok = req_size < 100_000 and len(raw) < 500_000 and ratio < 20
+    check(
+        f"first response compact (req {req_size} B, resp {len(raw)} B, {ratio:.1f}x)",
+        size_ok,
+        f"req={req_size} resp={len(raw)} ratio={ratio:.1f}",
+    )
+
+    # Canonical solution and exact weights survive the display limit.
+    sol = body.get("solution") or {}
+    weights = sol.get("weights", [])
+    canon_ok = (
+        [w["id"][:5] for w in weights] == ["G0E00", "G1E00", "G2E00", "G3E00"]
+        and len(weights) == 4
+        and all(w["fraction"] == "1/4" and (w["numerator"], w["denominator"]) == (1, 4)
+                for w in weights)
+    )
+    check("canonical solution with exact 1/4 weights preserved", canon_ok,
+          json.dumps([(w["id"][:5], w["fraction"]) for w in weights]))
+
+    # Classification still spans every endmember and is derived from the
+    # complete 3136-solution tie set: every member is in some but not all.
+    cls = body.get("classification", {})
+    cls_ok = len(cls) == 30 and all(v == "partial" for v in cls.values())
+    check("classification covers all 30 endmembers as partial", cls_ok,
+          f"{len(cls)} classes, values={set(cls.values())}")
+
+    # Walk every page through the proxy and reconstruct the canonical-order
+    # enumeration; this is how users still reach any required tie detail.
+    combos: list[tuple[str, ...]] = []
+    pages_ok = True
+    page_detail = ""
+    expected_counts = {}
+    for g, n in enumerate((7, 7, 8, 8)):
+        for k in range(n):
+            # ties containing one fixed member = product of the other groups
+            others = [m for h, m in enumerate((7, 7, 8, 8)) if h != g]
+            expected_counts[f"G{g}E{k:02d}"] = math.prod(others)
+    try:
+        for offset in range(0, 3136, page_size):
+            _, pbody = post(
+                f"{WEB}/api/audit/ties",
+                {**payload, "offset": offset, "limit": page_size},
+                timeout=30.0,
+            )
+            if pbody.get("tie_count") != 3136 or pbody.get("offset") != offset:
+                pages_ok = False
+                page_detail = f"bad page header at offset {offset}"
+                break
+            sols = pbody.get("solutions", [])
+            if len(sols) != min(page_size, 3136 - offset):
+                pages_ok = False
+                page_detail = f"bad page size at offset {offset}: {len(sols)}"
+                break
+            for s in sols:
+                ids = tuple(s["ids"])
+                combos.append(ids)
+                if [i[:2] for i in ids] != ["G0", "G1", "G2", "G3"]:
+                    pages_ok = False
+                    page_detail = f"group mix wrong at {offset}"
+                if not all(w["fraction"] == "1/4" for w in s["weights"]):
+                    pages_ok = False
+                    page_detail = f"weight not 1/4 at {offset}"
+    except Exception as exc:  # noqa: BLE001
+        pages_ok = False
+        page_detail = str(exc)
+
+    enumeration_ok = (
+        pages_ok
+        and len(combos) == 3136
+        and len(set(combos)) == 3136       # all distinct
+        and combos == sorted(combos)       # canonical lexicographic order
+    )
+    check("all 3136 ties reachable page-by-page, ordered, exact 1/4 weights",
+          enumeration_ok, page_detail or f"reconstructed={len(combos)}")
+
+    # The first-response classification must agree with the full enumeration:
+    # per-member occurrence counts are exactly the products of other groups.
+    counts: dict[str, int] = {}
+    for ids in combos:
+        for i in ids:
+            prefix = i[:5]
+            counts[prefix] = counts.get(prefix, 0) + 1
+    counts_ok = counts == expected_counts
+    check("full-enumeration membership counts match the all-partial classes",
+          counts_ok,
+          "" if counts_ok else json.dumps(counts)[:300])
+
+    # First UI render must not mount 3136 buttons: the production bundle must
+    # drive the numbered, page-sized lazy browser instead of mapping over the
+    # whole tie list with full joined ids as labels.
+    try:
+        import re
+
+        _, html = get(f"{WEB}/")
+        m = re.search(r'src="(/assets/[^"]+\.js)"', html)
+        bundle = get(f"{WEB}{m.group(1)}")[1] if m else ""
+        bundle_ok = bool(m) and "audit/ties" in bundle and "tie-num" in bundle
+        check("built UI uses numbered lazy tie browser (/api/audit/ties)",
+              bundle_ok, "markers missing from bundle" if not bundle_ok else "")
+    except Exception as exc:  # noqa: BLE001
+        check("built UI uses numbered lazy tie browser (/api/audit/ties)",
+              False, str(exc))
+
+
 def main() -> int:
     api_ok = wait_for(f"{API}/health", "api")
     web_ok = wait_for(f"{WEB}/healthz", "web")
@@ -226,6 +394,7 @@ def main() -> int:
     check_classification()
     check_web_build()
     check_smoke()
+    check_large_tie_paging()
 
     print("-" * 60)
     if failures:

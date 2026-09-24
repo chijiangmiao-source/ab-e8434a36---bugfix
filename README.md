@@ -46,7 +46,11 @@ docker compose run --rm verify
 3. 凸包外目标 `feasible=false` 且无解；
 4. 同优归类（等代价两条对角线 → 四个端元皆 partial；唯一解 → always/never）；
 5. 构建产物（Web 容器返回构建后的 `index.html` 且 JS bundle 可访问）；
-6. API 冒烟（直连与经 Web 代理的 `/health`、`POST /api/audit`）。
+6. API 冒烟（直连与经 Web 代理的 `/health`、`POST /api/audit`）；
+7. 长标识大同优集（30 个约 1000 字符标识、四组 7/7/8/8 → `tie_count=3136`）：
+   首次响应只内联一页且远小于全量展开，规范解与 1/4 精确权重保留，30 个端元
+   全部归类 partial，并逐页取回全部 3136 组同优解核对顺序、权重与出现计数；
+   构建后的 UI 必须使用编号懒加载同优解浏览器（`/api/audit/ties`）。
 
 ## HTTP 接口
 
@@ -61,6 +65,26 @@ docker compose run --rm verify
   "target": ["1", "1", "1"]
 }
 ```
+
+响应仍给出规范解、精确权重、精确 `tie_count` 与基于**全部**前两级同优解的
+`classification`，但同优解明细只内联第一页（`tied` 至多 `tie_page_size` 组，
+默认 20；另含 `tie_offset`）。同优解很多、标识很长时，这避免首次响应反复展开
+全部解（数万 KB）。其余同优解经无状态分页接口按需获取：
+
+- `POST /api/audit/ties`
+
+```json
+{
+  "endmembers": [ /* 与 /api/audit 完全相同的审计输入 */ ],
+  "target": ["1", "1", "1"],
+  "offset": 20,
+  "limit": 20
+}
+```
+
+返回 `{"offset", "tie_count", "solutions": [...]}`，`solutions` 为按标识字典序
+排列的同优解中 `[offset, offset+limit)` 这一页。客户端每次重放审计输入，服务端
+不保存结果集；翻页不改变 `tie_count` 与归类，二者始终由完整枚举得出。
 
 输入以原始文本提交，错误按字段定位（如 `endmembers[2].t1`、`target[0]`），
 非法输入或凸包外无解时前端**保留全部编辑内容**并就地高亮反馈。
