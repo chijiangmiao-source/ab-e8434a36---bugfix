@@ -45,8 +45,11 @@ docker compose run --rm verify
 2. 规范分数权重（四面体内点 → 四个 `1/4`；四位小数目标 `0.125` → `7/8 + 1/8`）；
 3. 凸包外目标 `feasible=false` 且无解；
 4. 同优归类（等代价两条对角线 → 四个端元皆 partial；唯一解 → always/never）；
-5. 构建产物（Web 容器返回构建后的 `index.html` 且 JS bundle 可访问）；
-6. API 冒烟（直连与经 Web 代理的 `/health`、`POST /api/audit`）。
+5. 长标识大规模同优场景（30 个约 1000 字符标识、四组 7/7/8/8 → `tie_count=3136`）：
+   首次响应只含一页预览而非全部同优解，规范解、精确权重与全量归类完整，
+   其余同优解经 `POST /api/audit/ties` 按需分页取回且与预览一致；
+6. 构建产物（Web 容器返回构建后的 `index.html`、JS bundle 可访问且按需分页加载同优解）；
+7. API 冒烟（直连与经 Web 代理的 `/health`、`POST /api/audit`）。
 
 ## HTTP 接口
 
@@ -64,6 +67,28 @@ docker compose run --rm verify
 
 输入以原始文本提交，错误按字段定位（如 `endmembers[2].t1`、`target[0]`），
 非法输入或凸包外无解时前端**保留全部编辑内容**并就地高亮反馈。
+
+### 同优解的预览与分页
+
+同优解可能极多（如 30 端元四组 7/7/8/8 时达 3136 组）。首次审计响应中：
+
+- `solution` 为规范解（含精确分数权重），`tie_count` 为同优解**总数**，
+  `classification` 始终依据**全部**前两级同优解归类——三者不受展示限制影响；
+- `tied` 只含规范序下的**第一页**（至多 24 组），不再逐一展开全部同优解。
+
+其余同优解按需分页获取，求解是确定性的，因此同一输入的分页窗口稳定：
+
+```
+POST /api/audit/ties
+{
+  "endmembers": [...], "target": ["1", "1", "1"],
+  "offset": 0, "limit": 24        # offset ≥ 0，1 ≤ limit ≤ 200
+}
+→ {"feasible": true, "tie_count": 3136, "offset": 0, "limit": 24, "tied": [...], "errors": []}
+```
+
+前端首次只渲染已加载页的同优解按钮（紧凑 `#n` 标签），点击“加载更多同优解”
+按需取回下一页，选中任一同优解仍可在权重表中查看其完整标识与精确权重。
 
 ### 输入规则
 

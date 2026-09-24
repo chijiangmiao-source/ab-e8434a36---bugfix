@@ -285,6 +285,11 @@ button.tie.active {
   border-color: var(--accent);
   color: #fff;
 }
+button.tie-more {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-style: dashed;
+}
 
 .infeasible {
   background: #fffbeb;

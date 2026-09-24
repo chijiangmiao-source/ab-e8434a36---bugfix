@@ -12,13 +12,23 @@ from fastapi.responses import JSONResponse
 from .models import (
     AuditRequest,
     AuditResponse,
+    FieldError,
     SolutionOut,
+    TiePageRequest,
+    TiePageResponse,
     WeightOut,
 )
 from .solver import AuditResult, Solution, audit
 from .validation import validate_request
 
 app = FastAPI(title="Volcanic Ash Endmember Audit", version="1.0.0")
+
+# The audit response itself carries only the first few cost-tied solutions
+# (canonical order); the rest are paged out on demand via /api/audit/ties.
+# tie_count and the always/partial/never classification are always computed
+# from the complete tie set, so no conclusion is lost by capping the preview.
+TIE_PREVIEW_LIMIT = 24
+MAX_TIE_PAGE_LIMIT = 200
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,7 +93,7 @@ def _serialize(result: AuditResult) -> AuditResponse:
     return AuditResponse(
         feasible=result.feasible,
         solution=_solution_out(result.solution) if result.solution else None,
-        tied=[_solution_out(s) for s in result.tied],
+        tied=[_solution_out(s) for s in result.tied[:TIE_PREVIEW_LIMIT]],
         tie_count=len(result.tied),
         classification=result.classification,
         errors=[],
@@ -96,3 +106,35 @@ def run_audit(req: AuditRequest) -> AuditResponse:
     if errors:
         return AuditResponse(feasible=False, errors=errors)
     return _serialize(audit(endmembers, target))
+
+
+@app.post("/api/audit/ties", response_model=TiePageResponse)
+def audit_ties(req: TiePageRequest) -> TiePageResponse:
+    """One page of the cost-tied minimum-support solutions, in canonical order.
+
+    The audit is deterministic, so re-running it for the same inputs yields
+    the same ordered tie set and any ``offset``/``limit`` window is stable.
+    """
+    endmembers, target, errors = validate_request(req.endmembers, list(req.target))
+    if req.offset < 0:
+        errors.append(FieldError(field="offset", message="offset 必须为非负整数"))
+    if not 1 <= req.limit <= MAX_TIE_PAGE_LIMIT:
+        errors.append(
+            FieldError(
+                field="limit",
+                message=f"limit 须为 1 至 {MAX_TIE_PAGE_LIMIT} 的整数",
+            )
+        )
+    if errors:
+        return TiePageResponse(errors=errors)
+    result = audit(endmembers, target)
+    if not result.feasible:
+        return TiePageResponse(feasible=False)
+    page = result.tied[req.offset : req.offset + req.limit]
+    return TiePageResponse(
+        feasible=True,
+        tie_count=len(result.tied),
+        offset=req.offset,
+        limit=req.limit,
+        tied=[_solution_out(s) for s in page],
+    )

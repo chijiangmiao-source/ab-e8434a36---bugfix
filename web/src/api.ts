@@ -1,4 +1,4 @@
-import type { AuditRequest, AuditResponse } from "./types";
+import type { AuditRequest, AuditResponse, TiePageResponse } from "./types";
 
 export async function fetchHealth(signal?: AbortSignal): Promise<boolean> {
   try {
@@ -19,4 +19,20 @@ export async function runAudit(req: AuditRequest): Promise<AuditResponse> {
     throw new Error(`API 异常：HTTP ${r.status}`);
   }
   return (await r.json()) as AuditResponse;
+}
+
+export async function fetchTiePage(
+  req: AuditRequest,
+  offset: number,
+  limit: number,
+): Promise<TiePageResponse> {
+  const r = await fetch("/api/audit/ties", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...req, offset, limit }),
+  });
+  if (!r.ok) {
+    throw new Error(`API 异常：HTTP ${r.status}`);
+  }
+  return (await r.json()) as TiePageResponse;
 }

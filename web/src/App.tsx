@@ -2,10 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Editor } from "./components/Editor";
 import { Projection, type PlotPoint } from "./components/Projection";
 import { ResultsPanel } from "./components/ResultsPanel";
-import { fetchHealth, runAudit } from "./api";
+import { fetchHealth, fetchTiePage, runAudit } from "./api";
 import { DEFAULT_ENDMEMBERS, DEFAULT_TARGET } from "./defaults";
-import type { AuditResponse, EndmemberRow } from "./types";
+import type { AuditRequest, AuditResponse, EndmemberRow, SolutionOut } from "./types";
 import "./styles.css";
+
+// How many further tied solutions each "load more" click pulls in.
+const TIE_PAGE_SIZE = 24;
 
 export default function App() {
   const [endmembers, setEndmembers] = useState<EndmemberRow[]>(DEFAULT_ENDMEMBERS);
@@ -16,6 +19,12 @@ export default function App() {
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [health, setHealth] = useState<boolean | null>(null);
   const [networkError, setNetworkError] = useState<string | null>(null);
+  // Snapshot of the request that produced `result`, so tie paging stays
+  // consistent with what is on screen even if the editor changes afterwards.
+  const [auditedReq, setAuditedReq] = useState<AuditRequest | null>(null);
+  // Tie pages fetched on demand beyond the preview already inside `result`.
+  const [extraTies, setExtraTies] = useState<SolutionOut[]>([]);
+  const [tiesLoading, setTiesLoading] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -47,8 +56,11 @@ export default function App() {
     setLoading(true);
     setNetworkError(null);
     try {
-      const res = await runAudit({ endmembers, target });
+      const req: AuditRequest = { endmembers, target };
+      const res = await runAudit(req);
       setResult(res);
+      setAuditedReq(req);
+      setExtraTies([]);
       setSelectedTie(0);
     } catch (err) {
       setNetworkError(err instanceof Error ? err.message : String(err));
@@ -56,6 +68,32 @@ export default function App() {
       setLoading(false);
     }
   }, [endmembers, target]);
+
+  // Ties known to the client: the preview from the audit response plus any
+  // pages loaded on demand since.
+  const loadedTies = useMemo<SolutionOut[]>(
+    () => (result ? result.tied.concat(extraTies) : []),
+    [result, extraTies],
+  );
+
+  const loadMoreTies = useCallback(async () => {
+    if (!result || !auditedReq || tiesLoading) return;
+    if (loadedTies.length >= result.tie_count) return;
+    setTiesLoading(true);
+    setNetworkError(null);
+    try {
+      const page = await fetchTiePage(auditedReq, loadedTies.length, TIE_PAGE_SIZE);
+      if (page.errors.length) {
+        setNetworkError(page.errors.map((e) => `${e.field}: ${e.message}`).join("；"));
+      } else {
+        setExtraTies((prev) => prev.concat(page.tied));
+      }
+    } catch (err) {
+      setNetworkError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTiesLoading(false);
+    }
+  }, [result, auditedReq, tiesLoading, loadedTies.length]);
 
   const addRow = () => {
     if (endmembers.length >= 30) return;
@@ -73,7 +111,7 @@ export default function App() {
 
   // ---- projection geometry -------------------------------------------------
   const activeSolution = result?.feasible
-    ? result.tied[selectedTie] ?? result.solution
+    ? loadedTies[selectedTie] ?? result.solution
     : null;
 
   const weightById = useMemo(() => {
@@ -149,7 +187,16 @@ export default function App() {
         batchError={batchError}
       />
 
-      {result && <ResultsPanel result={result} selectedTie={selectedTie} onSelectTie={setSelectedTie} />}
+      {result && (
+        <ResultsPanel
+          result={result}
+          loadedTies={loadedTies}
+          selectedTie={selectedTie}
+          onSelectTie={setSelectedTie}
+          onLoadMoreTies={loadMoreTies}
+          tiesLoading={tiesLoading}
+        />
+      )}
 
       <section className="projections">
         <h2>③ 联动投影（悬停任意图中的端元可同步高亮）</h2>

@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import MAX_TIE_PAGE_LIMIT, TIE_PREVIEW_LIMIT, app
 
 client = TestClient(app)
 
@@ -97,3 +97,105 @@ def test_classification_payload():
     r = _post({"endmembers": ems, "target": ["1", "1", "0"]})
     cls = r.json()["classification"]
     assert cls["A"] == "partial" and cls["E"] == "never"
+
+
+# ------------------------------------------------------- mass-tie behaviour
+def _groups_payload(sizes=(3, 3, 3, 3)):
+    """One group per tetrahedron vertex; target (1,1,1) forces one pick from
+    each group, so the tie count is the product of the group sizes."""
+    pts = [(0, 0, 0), (4, 0, 0), (0, 4, 0), (0, 0, 4)]
+    ems = []
+    for g, n in enumerate(sizes):
+        for i in range(n):
+            ems.append(
+                {
+                    "id": f"G{g}E{i}",
+                    "t0": str(pts[g][0]),
+                    "t1": str(pts[g][1]),
+                    "t2": str(pts[g][2]),
+                    "cost": "1",
+                }
+            )
+    return {"endmembers": ems, "target": ["1", "1", "1"]}
+
+
+def test_tied_preview_capped_but_count_and_classification_full():
+    body = _post(_groups_payload()).json()
+    assert body["feasible"] is True
+    # 3*3*3*3 tied solutions exist, but the first response must not
+    # enumerate them all -- only a bounded preview in canonical order.
+    assert body["tie_count"] == 81
+    assert len(body["tied"]) == TIE_PREVIEW_LIMIT
+    assert body["tied"][0] == body["solution"]
+    # conclusions still cover the complete tie set
+    assert len(body["classification"]) == 12
+    assert set(body["classification"].values()) == {"partial"}
+    weights = {w["id"]: w["fraction"] for w in body["solution"]["weights"]}
+    assert weights == {"G0E0": "1/4", "G1E0": "1/4", "G2E0": "1/4", "G3E0": "1/4"}
+    assert body["solution"]["cost"] == 4
+
+
+def test_tie_paging_covers_every_tie_consistently():
+    payload = _groups_payload()
+    first = _post(payload).json()
+
+    pages = []
+    offset = 0
+    while True:
+        r = client.post(
+            "/api/audit/ties", json={**payload, "offset": offset, "limit": 30}
+        )
+        body = r.json()
+        assert body["feasible"] is True
+        assert body["tie_count"] == 81
+        if not body["tied"]:
+            break
+        pages.extend(body["tied"])
+        offset += len(body["tied"])
+    assert len(pages) == 81  # every tied solution reachable through paging
+
+    # the preview in the audit response is exactly the first page
+    assert pages[:TIE_PREVIEW_LIMIT] == first["tied"]
+
+    keys = [tuple(s["ids"]) for s in pages]
+    assert len(set(keys)) == 81
+    assert keys == sorted(keys)  # canonical lexicographic order
+    for s in pages:
+        assert s["cost"] == 4
+        assert [w["fraction"] for w in s["weights"]] == ["1/4"] * 4
+
+
+def test_tie_paging_window_edges():
+    payload = _groups_payload()
+    r = client.post("/api/audit/ties", json={**payload, "offset": 80, "limit": 30})
+    page = r.json()["tied"]
+    assert len(page) == 1  # clamped at the end of the tie set
+    r = client.post("/api/audit/ties", json={**payload, "offset": 81, "limit": 30})
+    assert r.json()["tied"] == []
+
+
+def test_tie_paging_rejects_bad_window():
+    payload = _groups_payload()
+    r = client.post("/api/audit/ties", json={**payload, "offset": -1, "limit": 0})
+    fields = {e["field"] for e in r.json()["errors"]}
+    assert "offset" in fields and "limit" in fields
+    r = client.post(
+        "/api/audit/ties",
+        json={**payload, "offset": 0, "limit": MAX_TIE_PAGE_LIMIT + 1},
+    )
+    assert "limit" in {e["field"] for e in r.json()["errors"]}
+
+
+def test_tie_paging_infeasible_and_invalid_requests():
+    r = client.post(
+        "/api/audit/ties",
+        json={"endmembers": SQUARE, "target": ["1", "1", "9"]},
+    )
+    body = r.json()
+    assert body["feasible"] is False and body["tied"] == [] and not body["errors"]
+
+    r = client.post(
+        "/api/audit/ties",
+        json={"endmembers": SQUARE[:2], "target": ["1", "1", "0"]},
+    )
+    assert any(e["field"] == "endmembers" for e in r.json()["errors"])

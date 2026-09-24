@@ -7,8 +7,12 @@ Runs every required audit and exits non-zero on the first failed group:
   2. canonical rational weights (exact fraction strings)
   3. outside-convex-hull infeasibility
   4. tie classification (always / partial / never)
-  5. build artefacts (web container serves the production bundle)
-  6. API smoke (direct + through the web proxy)
+  5. long-id mass-tie audit: 3136 cost-tied solutions stay fully counted and
+     classified, but the first response ships only a bounded preview and the
+     remaining ties are paged out on demand
+  6. build artefacts (web container serves the production bundle, which loads
+     tie pages lazily instead of rendering every tie at once)
+  7. API smoke (direct + through the web proxy)
 
 Usage:  verify.py [api_base] [web_base]
 """
@@ -17,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -49,6 +54,15 @@ def post(url: str, payload: dict, timeout: float = 5.0):
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, json.loads(r.read().decode())
+
+
+def post_raw(url: str, payload: dict, timeout: float = 5.0):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read()
 
 
 def wait_for(url: str, label: str, attempts: int = 30) -> bool:
@@ -162,7 +176,165 @@ def check_classification() -> None:
     )
 
 
-# ------------------------------------------------------ 5. build artefacts
+# ------------------------------------- 5. long-id mass-tie audit (3136 ties)
+# 30 legal endmembers with ~1000-char ASCII ids in four vertex groups of
+# 7/7/8/8, all cost 1, target (1,1,1): every optimal solution picks one
+# member per group, so the first two levels tie 7*7*8*8 = 3136 ways.
+TIE_GROUPS = [(0, 0, 0), (4, 0, 0), (0, 4, 0), (0, 0, 4)]
+TIE_GROUP_SIZES = [7, 7, 8, 8]
+TIE_ID_LEN = 1000
+EXPECTED_TIES = 7 * 7 * 8 * 8  # 3136
+# The first response must stay a bounded preview, never a per-solution dump
+# (the pre-fix response was 26,240,200 bytes here, ~831x the request).
+MAX_FIRST_RESPONSE_BYTES = 1_000_000
+TIE_PREVIEW_MAX = 24
+
+
+def _long_id(group: int, idx: int) -> str:
+    base = f"G{group}-E{idx:02d}-"
+    return base + "x" * (TIE_ID_LEN - len(base))
+
+
+def _mass_tie_payload() -> dict:
+    ems = []
+    for g, (n, pt) in enumerate(zip(TIE_GROUP_SIZES, TIE_GROUPS)):
+        for i in range(n):
+            ems.append(
+                {
+                    "id": _long_id(g, i),
+                    "t0": str(pt[0]),
+                    "t1": str(pt[1]),
+                    "t2": str(pt[2]),
+                    "cost": "1",
+                }
+            )
+    return {"endmembers": ems, "target": ["1", "1", "1"]}
+
+
+def check_mass_tie_long_ids() -> None:
+    payload = _mass_tie_payload()
+    req_bytes = len(json.dumps(payload).encode())
+
+    # -- first response: complete conclusions, bounded enumeration -----------
+    try:
+        _, raw = post_raw(f"{API}/api/audit", payload, timeout=120.0)
+        body = json.loads(raw.decode())
+    except Exception as exc:  # noqa: BLE001
+        check("3136-tie long-id audit: first response", False, str(exc))
+        return
+
+    ok = body.get("feasible") is True and body.get("tie_count") == EXPECTED_TIES
+    check(
+        "3136-tie long-id audit: feasible, tie_count == 3136",
+        ok,
+        f"feasible={body.get('feasible')} tie_count={body.get('tie_count')}",
+    )
+
+    sol = body.get("solution") or {}
+    weights = sol.get("weights", [])
+    ok = (
+        sol.get("ids") == [_long_id(g, 0) for g in range(4)]
+        and sol.get("cost") == 4
+        and [w.get("fraction") for w in weights] == ["1/4"] * 4
+        and [(w.get("numerator"), w.get("denominator")) for w in weights]
+        == [(1, 4)] * 4
+    )
+    check(
+        "3136-tie long-id audit: canonical solution with exact 1/4 weights",
+        ok,
+        json.dumps(sol)[:200],
+    )
+
+    cls = body.get("classification", {})
+    submitted = [e["id"] for e in payload["endmembers"]]
+    ok = sorted(cls) == sorted(submitted) and set(cls.values()) == {"partial"}
+    check(
+        "3136-tie long-id audit: classification over all 30 ties-based classes",
+        ok,
+        f"{len(cls)} entries, values={sorted(set(cls.values()))}",
+    )
+
+    preview = body.get("tied", [])
+    ok = (
+        0 < len(preview) <= TIE_PREVIEW_MAX
+        and preview[0] == sol
+        and len(raw) <= MAX_FIRST_RESPONSE_BYTES
+    )
+    check(
+        "3136-tie long-id audit: first response is a bounded preview "
+        f"(tied={len(preview)}, {len(raw)} bytes vs {req_bytes} sent)",
+        ok,
+        f"tied={len(preview)} bytes={len(raw)}",
+    )
+
+    # -- on-demand pages: same 3136 ties, stable canonical windows ------------
+    def page(offset: int, limit: int) -> dict:
+        return post(
+            f"{API}/api/audit/ties",
+            {**payload, "offset": offset, "limit": limit},
+            timeout=120.0,
+        )[1]
+
+    try:
+        p_first = page(0, len(preview))
+        p_last = page(EXPECTED_TIES - 1, 5)
+        p_mid = page(1000, 7)
+    except Exception as exc:  # noqa: BLE001
+        check("3136-tie long-id audit: tie paging endpoint reachable", False, str(exc))
+        return
+
+    ok = (
+        p_first.get("tie_count") == EXPECTED_TIES
+        and p_first.get("tied") == preview
+        and p_last.get("tie_count") == EXPECTED_TIES
+        and len(p_last.get("tied", [])) == 1
+    )
+    check(
+        "3136-tie long-id audit: paged windows consistent with preview",
+        ok,
+        f"page0={len(p_first.get('tied', []))} last={len(p_last.get('tied', []))}",
+    )
+
+    mid = p_mid.get("tied", [])
+    ok = len(mid) == 7 and all(
+        len(s["ids"]) == 4
+        and {i[:2] for i in s["ids"]} == {"G0", "G1", "G2", "G3"}
+        and [w["fraction"] for w in s["weights"]] == ["1/4"] * 4
+        and s["cost"] == 4
+        for s in mid
+    )
+    check(
+        "3136-tie long-id audit: mid-window page well formed",
+        ok,
+        json.dumps(mid[:1])[:200],
+    )
+
+    _, bad = post(
+        f"{API}/api/audit/ties",
+        {**payload, "offset": -1, "limit": 0},
+        timeout=120.0,
+    )
+    fields = {e.get("field") for e in bad.get("errors", [])}
+    check(
+        "3136-tie long-id audit: invalid page window rejected",
+        {"offset", "limit"} <= fields,
+        json.dumps(bad)[:200],
+    )
+
+    # the same payload must survive the nginx proxy path unchanged
+    try:
+        _, proxied = post(f"{WEB}/api/audit", payload, timeout=120.0)
+        ok = (
+            proxied.get("tie_count") == EXPECTED_TIES
+            and len(proxied.get("tied", [])) <= TIE_PREVIEW_MAX
+        )
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        print(f"       proxied mass-tie audit error: {exc}")
+    check("3136-tie long-id audit: capped preview through web proxy", ok)
+
+
+# ------------------------------------------------------ 6. build artefacts
 def check_web_build() -> None:
     try:
         status, html = get(f"{WEB}/")
@@ -172,21 +344,25 @@ def check_web_build() -> None:
     has_root = status == 200 and '<div id="root">' in html
     check("web container serves production index.html", has_root)
     # the bundled JS asset referenced from the built HTML must exist
+    js = ""
     try:
-        import re
-
         m = re.search(r'src="(/assets/[^"]+\.js)"', html)
         asset_ok = bool(m)
         if m:
-            s, _ = get(f"{WEB}{m.group(1)}")
+            s, js = get(f"{WEB}{m.group(1)}")
             asset_ok = s == 200
         check("built JS bundle asset reachable", asset_ok,
               "no asset reference" if not m else "")
     except Exception as exc:  # noqa: BLE001
         check("built JS bundle asset reachable", False, str(exc))
+        return
+    # the shipped UI must page tie details on demand: the first result
+    # display renders only the loaded preview, never one button per tie
+    ok = "/api/audit/ties" in js and "加载更多同优解" in js
+    check("web bundle pages ties on demand (no full first render)", ok)
 
 
-# ---------------------------------------------------------------- 6. smoke
+# ---------------------------------------------------------------- 7. smoke
 def check_smoke() -> None:
     try:
         s, body = get(f"{API}/health")
@@ -224,6 +400,7 @@ def main() -> int:
     check_canonical_weights()
     check_outside_hull()
     check_classification()
+    check_mass_tie_long_ids()
     check_web_build()
     check_smoke()
 

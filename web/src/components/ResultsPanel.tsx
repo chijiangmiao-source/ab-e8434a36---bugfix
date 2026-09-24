@@ -2,8 +2,13 @@ import type { AuditResponse, SolutionOut } from "../types";
 
 interface ResultsProps {
   result: AuditResponse;
+  // Ties fetched so far (response preview + on-demand pages); only these are
+  // rendered as buttons, so a huge tie set never floods the first display.
+  loadedTies: SolutionOut[];
   selectedTie: number;
   onSelectTie: (index: number) => void;
+  onLoadMoreTies: () => void;
+  tiesLoading: boolean;
 }
 
 const CLASS_LABEL: Record<string, { text: string; cls: string }> = {
@@ -12,9 +17,17 @@ const CLASS_LABEL: Record<string, { text: string; cls: string }> = {
   never: { text: "从不", cls: "tag never" },
 };
 
-export function ResultsPanel({ result, selectedTie, onSelectTie }: ResultsProps) {
+export function ResultsPanel({
+  result,
+  loadedTies,
+  selectedTie,
+  onSelectTie,
+  onLoadMoreTies,
+  tiesLoading,
+}: ResultsProps) {
   const sol: SolutionOut | undefined =
-    result.tied[selectedTie] ?? result.solution ?? undefined;
+    loadedTies[selectedTie] ?? result.solution ?? undefined;
+  const hasMoreTies = loadedTies.length < result.tie_count;
 
   return (
     <section className="results">
@@ -67,17 +80,30 @@ export function ResultsPanel({ result, selectedTie, onSelectTie }: ResultsProps)
 
           {result.tie_count > 1 && (
             <div className="ties">
-              <span>同优解：</span>
-              {result.tied.map((s, i) => (
+              <span>同优解（仅列出已加载，点选查看明细）：</span>
+              {loadedTies.map((s, i) => (
                 <button
                   key={s.ids.join("|")}
                   type="button"
                   className={i === selectedTie ? "tie active" : "tie"}
+                  title={s.ids.join(" + ")}
                   onClick={() => onSelectTie(i)}
                 >
-                  {s.ids.join(" + ")}
+                  #{i + 1}
                 </button>
               ))}
+              {hasMoreTies && (
+                <button
+                  type="button"
+                  className="tie-more"
+                  onClick={onLoadMoreTies}
+                  disabled={tiesLoading}
+                >
+                  {tiesLoading
+                    ? "加载中…"
+                    : `加载更多同优解（已显示 ${loadedTies.length}/${result.tie_count}）`}
+                </button>
+              )}
             </div>
           )}
         </>
